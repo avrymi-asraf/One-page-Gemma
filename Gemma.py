@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
+import torch.profiler
 from typing import Optional, Tuple, Union
 
 
@@ -466,7 +467,6 @@ class Gemma2Model(nn.Module):
         self.norm = Gemma2RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.gradient_checkpointing = False
 
-
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -522,9 +522,7 @@ class Gemma2Model(nn.Module):
         # normalized
         # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
         # See https://github.com/huggingface/transformers/pull/29402
-        normalizer = torch.tensor(
-            self.hidden_size**0.5, dtype=hidden_states.dtype
-        )
+        normalizer = torch.tensor(self.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
 
         # decoder layers
@@ -610,18 +608,26 @@ class Gemma2Model(nn.Module):
 
 
 if __name__ == "__main__":
+    # Example model and data
     if torch.cuda.is_available():
-        torch.cuda.memory._record_memory_history(stacks="all")
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            device = torch.device("cuda")
 
-    model = Gemma2Model().to(device)
-    model.eval()
-    with torch.no_grad():
-        input_ids = torch.tensor([[1, 2, 3, 4, 5]]).to(device)
-        attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
-        output = model(input_ids,attention_mask)
-        print(output)
-    if torch.cuda.is_available():
-        torch.cuda.memory._dump_snapshot("my-gemmw.pickle")
+            model = Gemma2Model().to(device)
+            model.eval()
+            with torch.no_grad():
+                input_ids = torch.tensor([[1, 2, 3, 4, 5]]).to(device)
+                attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
+                output = model(input_ids, attention_mask)
+                print(output)
+
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        prof.export_chrome_trace("trace.json")
