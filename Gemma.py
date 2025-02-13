@@ -3,6 +3,25 @@ import torch.nn as nn
 from torch import Tensor
 import torch.profiler
 from typing import Optional, Tuple, Union
+from dataclasses import dataclass
+
+
+@dataclass
+class Config:
+    hidden_size: int = 3072
+    intermediate_size: int = 24576
+    num_heads: int = 16
+    num_key_value_heads: int = 16
+    head_dim: int = 256
+    rms_norm_eps: float = 1e-6
+    attention_dropout: float = 0.0
+    max_position_embeddings: int = 8192
+    rope_theta: float = 10000.0
+    attn_logit_softcapping: float = 50.0
+    sliding_window: int = 4096
+    vocab_size: int = 256000
+    padding_idx: int = 0
+    num_hidden_layers: int = 2
 
 
 class PytorchGELUTanh(nn.Module):
@@ -22,9 +41,9 @@ class PytorchGELUTanh(nn.Module):
 
 
 class Gemma2RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, config, dim: int):
         super().__init__()
-        self.eps = eps
+        self.eps = config.rms_norm_eps
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x):
@@ -42,10 +61,10 @@ class Gemma2RMSNorm(nn.Module):
 
 
 class Gemma2MLP(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = 3072
-        self.intermediate_size = 24576
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -56,12 +75,11 @@ class Gemma2MLP(nn.Module):
 
 
 class Gemma2RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(self, config, dim):
         super().__init__()
-
         self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
+        self.max_position_embeddings = config.max_position_embeddings
+        self.base = config.rope_theta
         inv_freq = 1.0 / (
             self.base
             ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim)
@@ -145,29 +163,25 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class Gemma2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, layer_idx: Optional[int] = None):
+
+class Gemma2Attention(nn.Module):
+    def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__()
         self.layer_idx = layer_idx
-        if layer_idx is None:
-            print(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
-        self.attention_dropout = 0.0
-        self.hidden_size = 3072
-        self.num_heads = 16
-        self.head_dim = 256
-        self.num_key_value_heads = 16
+        # ... (rest of the initialization)
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = 8192
-        self.rope_theta = 10000.0
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
         self.is_causal = True
-        self.scaling = 224**-0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_bias = False
-        self.sliding_window = 4096
-        self.attn_logit_softcapping = 50.0
+        self.sliding_window = config.sliding_window
+        self.attn_logit_softcapping = config.attn_logit_softcapping
 
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(
@@ -349,24 +363,18 @@ GEMMA2_ATTENTION_CLASSES = {"eager": Gemma2Attention}
 
 
 class Gemma2DecoderLayer(nn.Module):
-    def __init__(self, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
-        self.hidden_size = 3072
-        self.rms_norm_eps = 1e-6
-        self.self_attn = Gemma2Attention(layer_idx=layer_idx)
-        self.mlp = Gemma2MLP()
-        self.input_layernorm = Gemma2RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
+        self.hidden_size = config.hidden_size
+        self.rms_norm_eps = config.rms_norm_eps
+        self.self_attn = Gemma2Attention(config, layer_idx=layer_idx)
+        self.mlp = Gemma2MLP(config)
+        self.input_layernorm = Gemma2RMSNorm(config, self.hidden_size)
         self.is_sliding = not bool(layer_idx % 2)
-        self.pre_feedforward_layernorm = Gemma2RMSNorm(
-            self.hidden_size, eps=self.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = Gemma2RMSNorm(
-            self.hidden_size, eps=self.rms_norm_eps
-        )
-        self.sliding_window = 4096
-        self.post_attention_layernorm = Gemma2RMSNorm(
-            self.hidden_size, eps=self.rms_norm_eps
-        )
+        self.pre_feedforward_layernorm = Gemma2RMSNorm(config, self.hidden_size)
+        self.post_feedforward_layernorm = Gemma2RMSNorm(config, self.hidden_size)
+        self.sliding_window = config.sliding_window
+        self.post_attention_layernorm = Gemma2RMSNorm(config, self.hidden_size)
 
     def forward(
         self,
@@ -444,29 +452,20 @@ class Gemma2DecoderLayer(nn.Module):
 
 
 class Gemma2Model(nn.Module):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Gemma2DecoderLayer`]
-
-    Args:
-        config: Gemma2Config
-    """
-
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self.padding_idx = 0
-        self.vocab_size = 256000
-        num_hidden_layers = 2
-        self.hidden_size = 3072
-        self.rms_norm_eps = 1e-6
+        self.padding_idx = config.padding_idx
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        self.rms_norm_eps = config.rms_norm_eps
         self.embed_tokens = nn.Embedding(
             self.vocab_size, self.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
-            [Gemma2DecoderLayer(layer_idx) for layer_idx in range(num_hidden_layers)]
+            [Gemma2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Gemma2RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
+        self.norm = Gemma2RMSNorm(config, self.hidden_size)
         self.gradient_checkpointing = False
-
     def get_input_embeddings(self):
         return self.embed_tokens
 
