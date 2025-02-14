@@ -4,6 +4,7 @@ from torch import Tensor
 import torch.profiler
 from typing import Optional, Tuple, Union
 from dataclasses import dataclass
+import argparse
 
 
 @dataclass
@@ -22,6 +23,48 @@ class Config:
     vocab_size: int = 256000
     padding_idx: int = 0
     num_hidden_layers: int = 2
+
+
+# Set up argument parser
+parser = argparse.ArgumentParser(description="Gemma2 Model Configuration")
+parser.add_argument("--hidden_size", type=int, default=3072, help="Hidden size")
+parser.add_argument("--intermediate_size", type=int, default=24576, help="Intermediate size")
+parser.add_argument("--num_heads", type=int, default=16, help="Number of attention heads")
+parser.add_argument("--num_key_value_heads", type=int, default=16, help="Number of key-value heads")
+parser.add_argument("--head_dim", type=int, default=256, help="Dimension of each head")
+parser.add_argument("--rms_norm_eps", type=float, default=1e-6, help="RMS normalization epsilon")
+parser.add_argument("--attention_dropout", type=float, default=0.0, help="Attention dropout")
+parser.add_argument("--max_position_embeddings", type=int, default=8192, help="Maximum position embeddings")
+parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE theta")
+parser.add_argument("--attn_logit_softcapping", type=float, default=50.0, help="Attention logit softcapping")
+parser.add_argument("--sliding_window", type=int, default=4096, help="Sliding window size")
+parser.add_argument("--vocab_size", type=int, default=256000, help="Vocabulary size")
+parser.add_argument("--padding_idx", type=int, default=0, help="Padding index")
+parser.add_argument("--num_hidden_layers", type=int, default=2, help="Number of hidden layers")
+
+# Add arguments for CUDA and profiling
+parser.add_argument("--use_cuda", action="store_true", help="Enable CUDA execution if available")
+parser.add_argument("--profile", action="store_true", help="Enable profiling")
+
+args = parser.parse_args()
+
+# Create a Config object from the parsed arguments
+config = Config(
+    hidden_size=args.hidden_size,
+    intermediate_size=args.intermediate_size,
+    num_heads=args.num_heads,
+    num_key_value_heads=args.num_key_value_heads,
+    head_dim=args.head_dim,
+    rms_norm_eps=args.rms_norm_eps,
+    attention_dropout=args.attention_dropout,
+    max_position_embeddings=args.max_position_embeddings,
+    rope_theta=args.rope_theta,
+    attn_logit_softcapping=args.attn_logit_softcapping,
+    sliding_window=args.sliding_window,
+    vocab_size=args.vocab_size,
+    padding_idx=args.padding_idx,
+    num_hidden_layers=args.num_hidden_layers,
+)
 
 
 class PytorchGELUTanh(nn.Module):
@@ -206,9 +249,8 @@ class Gemma2Attention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=self.attention_bias
         )
         self.rotary_emb = Gemma2RotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
+            config,
+            dim=self.head_dim,
         )
 
     def forward(
@@ -462,10 +504,14 @@ class Gemma2Model(nn.Module):
             self.vocab_size, self.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
-            [Gemma2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                Gemma2DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = Gemma2RMSNorm(config, self.hidden_size)
         self.gradient_checkpointing = False
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -485,7 +531,6 @@ class Gemma2Model(nn.Module):
         return_dict=False,
         cache_position: Optional[torch.LongTensor] = None,
     ):
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -607,26 +652,51 @@ class Gemma2Model(nn.Module):
 
 
 if __name__ == "__main__":
-    # Example model and data
-    if torch.cuda.is_available():
+    # Device selection based on arguments and CUDA availability
+    device = torch.device("cpu")
+    if args.use_cuda and torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Running on CUDA.")
+    else:
+        print("Running on CPU.")
+
+    # Profiling context based on arguments
+    if args.profile:
+        print("Profiling enabled.")
+        profiler_activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            profiler_activities.append(torch.profiler.ProfilerActivity.CUDA)
+
         with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/gemma2_profiler"),
+            activities=profiler_activities,
             record_shapes=True,
             profile_memory=True,
             with_stack=True,
         ) as prof:
-            device = torch.device("cuda")
-
-            model = Gemma2Model().to(device)
+            model = Gemma2Model(config).to(device)
             model.eval()
             with torch.no_grad():
                 input_ids = torch.tensor([[1, 2, 3, 4, 5]]).to(device)
                 attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
                 output = model(input_ids, attention_mask)
-                print(output)
+                print(output.last_hidden_state)
 
-        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-        prof.export_chrome_trace("trace.json")
+            print(
+                prof.key_averages()
+                .table(sort_by="cpu_time_total" if device.type == "cpu" else "cuda_time_total", row_limit=10)
+            )
+            if device.type == 'cuda':
+                print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+            # prof.export_chrome_trace("trace.json") # for chrome://tracing, consider tensorboard trace handler instead
+
+    else:
+        print("Profiling disabled.")
+        model = Gemma2Model(config).to(device)
+        model.eval()
+        with torch.no_grad():
+            input_ids = torch.tensor([[1, 2, 3, 4, 5]]).to(device)
+            attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
+            output = model(input_ids, attention_mask)
+            print(output.last_hidden_state)
