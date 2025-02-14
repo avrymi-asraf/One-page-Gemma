@@ -46,25 +46,6 @@ parser.add_argument("--num_hidden_layers", type=int, default=2, help="Number of 
 parser.add_argument("--use_cuda", action="store_true", help="Enable CUDA execution if available")
 parser.add_argument("--profile", action="store_true", help="Enable profiling")
 
-args = parser.parse_args()
-
-# Create a Config object from the parsed arguments
-config = Config(
-    hidden_size=args.hidden_size,
-    intermediate_size=args.intermediate_size,
-    num_heads=args.num_heads,
-    num_key_value_heads=args.num_key_value_heads,
-    head_dim=args.head_dim,
-    rms_norm_eps=args.rms_norm_eps,
-    attention_dropout=args.attention_dropout,
-    max_position_embeddings=args.max_position_embeddings,
-    rope_theta=args.rope_theta,
-    attn_logit_softcapping=args.attn_logit_softcapping,
-    sliding_window=args.sliding_window,
-    vocab_size=args.vocab_size,
-    padding_idx=args.padding_idx,
-    num_hidden_layers=args.num_hidden_layers,
-)
 
 
 class PytorchGELUTanh(nn.Module):
@@ -652,6 +633,27 @@ class Gemma2Model(nn.Module):
 
 
 if __name__ == "__main__":
+    args = parser.parse_args()
+
+# Create a Config object from the parsed arguments
+    config = Config(
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        num_heads=args.num_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        head_dim=args.head_dim,
+        rms_norm_eps=args.rms_norm_eps,
+        attention_dropout=args.attention_dropout,
+        max_position_embeddings=args.max_position_embeddings,
+        rope_theta=args.rope_theta,
+        attn_logit_softcapping=args.attn_logit_softcapping,
+        sliding_window=args.sliding_window,
+        vocab_size=args.vocab_size,
+        padding_idx=args.padding_idx,
+        num_hidden_layers=args.num_hidden_layers,
+    )
+
+
     # Device selection based on arguments and CUDA availability
     device = torch.device("cpu")
     if args.use_cuda and torch.cuda.is_available():
