@@ -683,7 +683,7 @@ if __name__ == "__main__":
                 input_ids = torch.tensor([[1, 2, 3, 4, 5]]).to(device)
                 attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
                 output = model(input_ids, attention_mask)
-                print(output.last_hidden_state)
+                print(output[0])
 
             print(
                 prof.key_averages()
@@ -700,5 +700,5 @@ if __name__ == "__main__":
         with torch.no_grad():
             input_ids = torch.tensor([[1, 2, 3, 4, 5]]).to(device)
             attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
-            output = model(input_ids, attention_mask)
-            print(output.last_hidden_state)
+            output = model(input_ids, attention_mask)[0]
+            print(output)
