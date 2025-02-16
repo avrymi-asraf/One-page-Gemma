@@ -23,29 +23,61 @@ class Config:
     vocab_size: int = 256000
     padding_idx: int = 0
     num_hidden_layers: int = 2
+    attention: str = "sdpa"
 
 
 # Set up argument parser
 parser = argparse.ArgumentParser(description="Gemma2 Model Configuration")
 parser.add_argument("--hidden_size", type=int, default=3072, help="Hidden size")
-parser.add_argument("--intermediate_size", type=int, default=24576, help="Intermediate size")
-parser.add_argument("--num_heads", type=int, default=16, help="Number of attention heads")
-parser.add_argument("--num_key_value_heads", type=int, default=16, help="Number of key-value heads")
+parser.add_argument(
+    "--intermediate_size", type=int, default=24576, help="Intermediate size"
+)
+parser.add_argument(
+    "--num_heads", type=int, default=16, help="Number of attention heads"
+)
+parser.add_argument(
+    "--num_key_value_heads", type=int, default=16, help="Number of key-value heads"
+)
 parser.add_argument("--head_dim", type=int, default=256, help="Dimension of each head")
-parser.add_argument("--rms_norm_eps", type=float, default=1e-6, help="RMS normalization epsilon")
-parser.add_argument("--attention_dropout", type=float, default=0.0, help="Attention dropout")
-parser.add_argument("--max_position_embeddings", type=int, default=8192, help="Maximum position embeddings")
+parser.add_argument(
+    "--rms_norm_eps", type=float, default=1e-6, help="RMS normalization epsilon"
+)
+parser.add_argument(
+    "--attention_dropout", type=float, default=0.0, help="Attention dropout"
+)
+parser.add_argument(
+    "--max_position_embeddings",
+    type=int,
+    default=8192,
+    help="Maximum position embeddings",
+)
 parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE theta")
-parser.add_argument("--attn_logit_softcapping", type=float, default=50.0, help="Attention logit softcapping")
-parser.add_argument("--sliding_window", type=int, default=4096, help="Sliding window size")
+parser.add_argument(
+    "--attn_logit_softcapping",
+    type=float,
+    default=50.0,
+    help="Attention logit softcapping",
+)
+parser.add_argument(
+    "--sliding_window", type=int, default=4096, help="Sliding window size"
+)
 parser.add_argument("--vocab_size", type=int, default=256000, help="Vocabulary size")
 parser.add_argument("--padding_idx", type=int, default=0, help="Padding index")
-parser.add_argument("--num_hidden_layers", type=int, default=2, help="Number of hidden layers")
+parser.add_argument(
+    "--num_hidden_layers", type=int, default=2, help="Number of hidden layers"
+)
+parser.add_argument(
+    "--attention",
+    type=str,
+    default="sdpa",
+    help="Type of attention, can be sdpa or eager",
+)
 
 # Add arguments for CUDA and profiling
-parser.add_argument("--use_cuda", action="store_true", help="Enable CUDA execution if available")
+parser.add_argument(
+    "--use_cuda", action="store_true", help="Enable CUDA execution if available"
+)
 parser.add_argument("--profile", action="store_true", help="Enable profiling")
-
 
 
 class PytorchGELUTanh(nn.Module):
@@ -184,7 +216,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-
 def sdpa_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -234,9 +265,6 @@ def sdpa_attention_forward(
     return attn_output, None
 
 
-
-
-
 class Gemma2Attention(nn.Module):
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__()
@@ -255,6 +283,7 @@ class Gemma2Attention(nn.Module):
         self.attention_bias = False
         self.sliding_window = config.sliding_window
         self.attn_logit_softcapping = config.attn_logit_softcapping
+        self.attention = config.attention
 
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(
@@ -286,6 +315,7 @@ class Gemma2Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value=None,
@@ -293,78 +323,38 @@ class Gemma2Attention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
-        )
-
+        cos, sin = position_embeddings
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {
                 "sin": sin,
                 "cos": cos,
-                "sliding_window": self.sliding_window,
                 "cache_position": cache_position,
+                "sliding_window": self.sliding_window,
             }
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_weights = (
-            torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            attn_output, attn_weights = sdpa_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            softcap=self.attn_logit_softcapping,
         )
 
-        if self.attn_logit_softcapping is not None:
-            attn_weights = attn_weights / self.attn_logit_softcapping
-            attn_weights = torch.tanh(attn_weights)
-            attn_weights = attn_weights * self.attn_logit_softcapping
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.view(bsz, q_len, -1)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
@@ -684,7 +674,7 @@ class Gemma2Model(nn.Module):
 if __name__ == "__main__":
     args = parser.parse_args()
 
-# Create a Config object from the parsed arguments
+    # Create a Config object from the parsed arguments
     config = Config(
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
@@ -700,8 +690,8 @@ if __name__ == "__main__":
         vocab_size=args.vocab_size,
         padding_idx=args.padding_idx,
         num_hidden_layers=args.num_hidden_layers,
+        attention=args.attention,
     )
-
 
     # Device selection based on arguments and CUDA availability
     device = torch.device("cpu")
@@ -720,7 +710,9 @@ if __name__ == "__main__":
 
         with torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/gemma2_profiler"),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                "./log/gemma2_profiler"
+            ),
             activities=profiler_activities,
             record_shapes=True,
             profile_memory=True,
@@ -735,11 +727,19 @@ if __name__ == "__main__":
                 print(output[0])
 
             print(
-                prof.key_averages()
-                .table(sort_by="cpu_time_total" if device.type == "cpu" else "cuda_time_total", row_limit=10)
+                prof.key_averages().table(
+                    sort_by=(
+                        "cpu_time_total" if device.type == "cpu" else "cuda_time_total"
+                    ),
+                    row_limit=10,
+                )
             )
-            if device.type == 'cuda':
-                print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+            if device.type == "cuda":
+                print(
+                    prof.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=10
+                    )
+                )
             # prof.export_chrome_trace("trace.json") # for chrome://tracing, consider tensorboard trace handler instead
 
     else:
@@ -751,4 +751,3 @@ if __name__ == "__main__":
             attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
             output = model(input_ids, attention_mask)[0]
             print(output)
-        
