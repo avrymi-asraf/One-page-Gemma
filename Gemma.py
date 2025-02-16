@@ -184,8 +184,57 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class Gemma2Attention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+def sdpa_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, None]:
+    if hasattr(module, "num_key_value_groups"):
+        key = repeat_kv(key, module.num_key_value_groups)
+        value = repeat_kv(value, module.num_key_value_groups)
+
+    causal_mask = attention_mask
+    if attention_mask is not None:
+        causal_mask = causal_mask[:, :, :, : key.shape[-2]]
+
+    # SDPA with memory-efficient backend is bugged with non-contiguous inputs and custom attn_mask for some torch versions
+    # Reference: https://github.com/pytorch/pytorch/issues/112577.
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
+    # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+    # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+    if is_causal is None:
+        is_causal = causal_mask is None and query.shape[2] > 1
+
+    # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
+    # We convert it to a bool for the SDPA kernel that only accepts bools.
+    if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
+        is_causal = is_causal.item()
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=causal_mask,
+        dropout_p=dropout,
+        scale=scaling,
+        is_causal=is_causal,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, None
+
+
+
 
 
 class Gemma2Attention(nn.Module):
@@ -702,3 +751,4 @@ if __name__ == "__main__":
             attention_mask = torch.tensor([[1, 1, 1, 1, 1]]).to(device)
             output = model(input_ids, attention_mask)[0]
             print(output)
+        
