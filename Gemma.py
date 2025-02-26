@@ -64,7 +64,7 @@ parser.add_argument(
 parser.add_argument("--vocab_size", type=int, default=256000, help="Vocabulary size")
 parser.add_argument("--padding_idx", type=int, default=0, help="Padding index")
 parser.add_argument(
-    "--num_hidden_layers", type=int, default=2, help="Number of hidden layers"
+    "-n", "--num_hidden_layers", type=int, default=2, help="Number of hidden layers"
 )
 parser.add_argument(
     "--attention",
@@ -75,7 +75,10 @@ parser.add_argument(
 
 # Add arguments for CUDA and profiling
 parser.add_argument(
-    "--use_cuda", action="store_true", default=True, help="Enable CUDA execution if available"
+    "--use_cuda",
+    action="store_true",
+    default=True,
+    help="Enable CUDA execution if available",
 )
 parser.add_argument("--profile", action="store_true", help="Enable profiling")
 
@@ -280,7 +283,7 @@ class Gemma2Attention(nn.Module):
         self.is_causal = True
         self.scaling = 224**-0.5
         self.attention_bias = False
-        self.sliding_window  = config.sliding_window if not bool(layer_idx % 2) else None
+        self.sliding_window = config.sliding_window if not bool(layer_idx % 2) else None
         self.attn_logit_softcapping = config.attn_logit_softcapping
 
         if self.hidden_size % self.num_heads != 0:
@@ -311,73 +314,83 @@ class Gemma2Attention(nn.Module):
         )
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_value= None,
-            output_attentions: bool = False,
-            use_cache: bool = False,
-            cache_position: Optional[torch.LongTensor] = None,
-        ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
-            bsz, q_len, _ = hidden_states.size()
+        bsz, q_len, _ = hidden_states.size()
 
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
-            query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
 
-            if past_key_value is not None:
-                # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                cache_kwargs = {
-                    "sin": sin,
-                    "cos": cos,
-                    "sliding_window": self.sliding_window,
-                    "cache_position": cache_position,
-                }
-                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-            causal_mask = attention_mask
-            if attention_mask is not None:
-                causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
-
-            # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-            # Reference: https://github.com/pytorch/pytorch/issues/112577.
-            if query_states.device.type == "cuda" and causal_mask is not None:
-                query_states = query_states.contiguous()
-                key_states = key_states.contiguous()
-                value_states = value_states.contiguous()
-
-            # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-            # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-            is_causal = True if causal_mask is None and q_len > 1 else False
-
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=causal_mask,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                is_causal=is_causal,
-                scale=self.scaling,
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "sliding_window": self.sliding_window,
+                "cache_position": cache_position,
+            }
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-            attn_output = attn_output.transpose(1, 2).contiguous()
-            attn_output = attn_output.view(bsz, q_len, -1)
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            attn_output = self.o_proj(attn_output)
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
-            return attn_output, None, past_key_value
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+            scale=self.scaling,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, -1)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
 
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
